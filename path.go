@@ -32,6 +32,7 @@ func PathString(s string) (*Path, error) {
 	builder := &PathBuilder{}
 	for cursor < length {
 		c := buf[cursor]
+		fmt.Println(string(c))
 		switch c {
 		case '$':
 			builder = builder.Root()
@@ -187,8 +188,50 @@ func parsePathIndex(b *PathBuilder, buf []rune, cursor int) (*PathBuilder, []run
 			return nil, nil, 0, errors.Wrapf(err, "failed to parse number")
 		}
 		return b.Index(uint(num)), buf, cursor + 1, nil
+	default:
+		return parsePairKeyValue(b, buf, cursor)
 	}
 	return nil, nil, 0, errors.Wrapf(ErrInvalidPathString, "invalid character %s at %d", c, cursor)
+}
+
+func parsePairKeyValue(b *PathBuilder, buf []rune, cursor int) (*PathBuilder, []rune, int, error) {
+	length := len(buf)
+	// if cursor+1 < length && buf[cursor+1] == '.' {
+	// 	b, buf, c, err := parsePathRecursive(b, buf, cursor)
+	// 	if err != nil {
+	// 		return nil, nil, 0, errors.Wrapf(err, "failed to parse path of recursive")
+	// 	}
+	// 	return b, buf, c, nil
+	// }
+	// cursor++ // skip . character
+	start, mid := cursor, cursor
+
+	// if started single quote, looking for end single quote char
+	if cursor < length && buf[cursor] == '\'' {
+		return parseQuotedKey(b, buf, cursor)
+	}
+	for ; cursor < length; cursor++ {
+		c := buf[cursor]
+		switch c {
+		case '$':
+			return nil, nil, 0, errors.Wrapf(ErrInvalidPathString, "specified '$' after '.' character")
+		case '*':
+			return nil, nil, 0, errors.Wrapf(ErrInvalidPathString, "specified '*' after '.' character")
+		case ']':
+			goto end
+		case '[', '.':
+			return nil, nil, 0, errors.Wrapf(ErrInvalidPathString, "specified '[' after '.' character")
+		case '=':
+			mid = cursor
+		}
+	}
+end:
+	if start == cursor {
+		return nil, nil, 0, errors.Wrapf(ErrInvalidPathString, "cloud not find by empty key")
+	}
+	matchPair := make(map[string]string)
+	matchPair[string(buf[start:mid])] = string(buf[mid+1 : cursor])
+	return b.matchPair(matchPair), buf, cursor + 1, nil
 }
 
 // Path represent YAMLPath ( like a JSONPath ).
@@ -420,12 +463,19 @@ func (b *PathBuilder) child(name string) *PathBuilder {
 
 // Child add '.name' to current path.
 func (b *PathBuilder) Child(name string) *PathBuilder {
+	fmt.Println(name)
 	return b.child(b.normalizeSelectorName(name))
 }
 
 // Index add '[idx]' to current path.
 func (b *PathBuilder) Index(idx uint) *PathBuilder {
 	b.node = b.node.chain(newIndexNode(idx))
+	return b
+}
+
+//add pair
+func (b *PathBuilder) matchPair(pair map[string]string) *PathBuilder {
+	b.node = b.node.chain(newPairNode(pair))
 	return b
 }
 
@@ -791,4 +841,109 @@ func (n *recursiveNode) replace(node ast.Node, target ast.Node) error {
 		return errors.Wrapf(err, "failed to replace")
 	}
 	return nil
+}
+
+//add
+type pairNode struct {
+	*basePathNode
+	selector map[string]string
+}
+
+func newPairNode(selector map[string]string) *pairNode {
+	return &pairNode{
+		basePathNode: &basePathNode{},
+		selector:     selector,
+	}
+}
+
+func (n *pairNode) replace(node ast.Node, target ast.Node) error {
+	if node.Type() != ast.SequenceType {
+		return errors.Wrapf(ErrInvalidQuery, "expected sequence type node. but got %s", node.Type())
+	}
+	sequence := node.(*ast.SequenceNode)
+	// if n.selector >= uint(len(sequence.Values)) {
+	// 	return errors.Wrapf(ErrInvalidQuery, "expected index is %d. but got sequences has %d items", n.selector, sequence.Val
+
+	matchPairIdx := -1
+	for i, v := range sequence.Values {
+
+		if isMatched := n.isMatchedNode(v); isMatched {
+			matchPairIdx = i
+			break
+		}
+
+	}
+
+	//
+	if n.child == nil {
+		if err := sequence.Replace(int(matchPairIdx), target); err != nil {
+			return errors.Wrapf(err, "failed to replace")
+		}
+		return nil
+	}
+	if err := n.child.replace(sequence.Values[matchPairIdx], target); err != nil {
+		return errors.Wrapf(err, "failed to replace")
+	}
+	return nil
+}
+func (n *pairNode) isMatchedNode(node ast.Node) bool {
+	isMatched := false
+	switch typedNode := node.(type) {
+	case *ast.MappingNode:
+		for _, value := range typedNode.Values {
+			if isMatched = n.isMatchedNode(value); isMatched {
+				break
+			}
+		}
+	case *ast.MappingValueNode:
+		key := typedNode.Key.GetToken().Value
+		if selectorValue, ok := n.selector[key]; ok {
+			fmt.Println(selectorValue)
+			if selectorValue == typedNode.Value.GetToken().Value {
+				return true
+			}
+
+		}
+	}
+	return isMatched
+}
+func (n *pairNode) filter(node ast.Node) (ast.Node, error) {
+	if node.Type() != ast.SequenceType {
+		return nil, errors.Wrapf(ErrInvalidQuery, "expected sequence type node. but got %s", node.Type())
+	}
+	sequence := node.(*ast.SequenceNode)
+	// if n.selector >= uint(len(sequence.Values)) {
+	// 	return nil, errors.Wrapf(ErrInvalidQuery, "expected index is %d. but got sequences has %d items", n.selector, sequence.Values)
+	// }
+	matchPairIdx := -1
+	for i, v := range sequence.Values {
+
+		switch typedNode := v.(type) {
+
+		case *ast.MappingValueNode:
+			key := typedNode.Key.GetToken().Value
+			if selectorValue, ok := n.selector[key]; ok {
+				fmt.Println(selectorValue)
+				matchPairIdx = i
+			}
+		}
+
+	}
+	value := sequence.Values[matchPairIdx]
+	if n.child == nil {
+		return value, nil
+	}
+	filtered, err := n.child.filter(value)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to filter")
+	}
+	return filtered, nil
+}
+
+func (n *pairNode) String() string {
+	s := fmt.Sprintf("[%v]", n.selector)
+	if n.child != nil {
+		s += n.child.String()
+	}
+	return s
 }
